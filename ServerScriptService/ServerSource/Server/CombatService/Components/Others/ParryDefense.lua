@@ -1,29 +1,65 @@
+local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Knit = require(ReplicatedStorage.Packages.Knit)
 
-local ParryDefense = {}
-
-local Config = require(ReplicatedStorage.Configs.ConfigPack)
-
-local function isPvP(attacker, defender)
-	return attacker and defender and attacker.UserId ~= 0 and defender.UserId ~= 0
+local okCfg, Config = pcall(function()
+	return require(ReplicatedStorage:WaitForChild("Configs"):WaitForChild("ConfigPack"))
+end)
+if not okCfg then
+	warn("[ParryDefense] ConfigPack require failed: ", Config)
+	Config = {}
 end
 
--- Returns: parried:boolean, reduction:number, breakStun:number, hitSoundId:string?, breakSoundId:string?
-function ParryDefense.Check(defender: Player, ctx)
-	local others = script.Parent
-	local ParryState = require(others.ParryState)
-	if not ParryState.IsActive(defender) then
-		return false, 0, 0
+local ParryCfg = (Config.MartialArts and Config.MartialArts.KungFu and Config.MartialArts.KungFu.Parry) or {}
+
+local M = {}
+
+-- Resolve parry effect. Returns: finalDamage:number, info:table
+-- ctx = { Damage:number, DamageType:string, Flags:table? }
+function M.Resolve(attacker, defender, ctx)
+	ctx = ctx or {}
+	local dmg   = tonumber(ctx.Damage) or 0
+	local flags = ctx.Flags or {}
+
+	-- ParryBreak skills ignore parry reduction
+	if flags.ParryBreak then
+		return dmg, { brokeParry = true }
 	end
-	if ctx and ctx.Flags and ctx.Flags.ParryBreak then
-		local stun = (Config.MartialArts and Config.MartialArts.KungFu and Config.MartialArts.KungFu.Parry and Config.MartialArts.KungFu.Parry.BreakStunSeconds) or 1
-		local breakSfx = Config.Sounds and Config.Sounds.ParryBreak
-		return true, 0, stun, nil, breakSfx
+
+	-- Ask CombatService if defender is actively parrying
+	local CS = Knit.GetService("CombatService")
+	local isParrying = false
+	if CS and CS.IsParrying then
+		local ok, res = pcall(function() return CS:IsParrying(defender) end)
+		isParrying = ok and res or false
 	end
-	local pCfg = Config.MartialArts and Config.MartialArts.KungFu and Config.MartialArts.KungFu.Parry or {}
-	local reduction = isPvP(ctx and ctx.attacker, defender) and (pCfg.PvPReduction or 0.8) or (pCfg.PvEReduction or 0.9)
-	local hitSfx = Config.Sounds and Config.Sounds.ParryHit
-	return true, reduction, 0, hitSfx, nil
+	if not isParrying then
+		return dmg -- no parry active
+	end
+
+	-- Parry reduction (does NOT stack with Defense; this replaces it)
+	local pvpMult = tonumber(ParryCfg.PvPReduction) or 0.8
+	local pveMult = tonumber(ParryCfg.PvEReduction) or 0.9
+
+	local isAttackerPlayer = false
+	if typeof(attacker) == "Instance" then
+		if attacker:IsA("Player") then
+			isAttackerPlayer = true
+		elseif attacker:IsA("Model") then
+			isAttackerPlayer = Players:GetPlayerFromCharacter(attacker) ~= nil
+		end
+	end
+
+	local mult = isAttackerPlayer and pvpMult or pveMult
+	local reduced = math.max(0, dmg * (1 - mult))
+	return reduced, { parried = true, parryMult = mult }
 end
 
-return ParryDefense
+-- Compatibility for code that expects Check(): returns isParried:boolean, finalDamage:number, info:table
+function M.Check(attacker, defender, ctx)
+	local final, info = M.Resolve(attacker, defender, ctx)
+	local parried = info and (info.parried or info.brokeParry) or false
+	return parried, final, info
+end
+
+return M

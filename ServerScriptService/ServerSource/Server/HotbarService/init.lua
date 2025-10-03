@@ -1,74 +1,60 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-
 local Knit = require(ReplicatedStorage.Packages.Knit)
 
 local HotbarService = Knit.CreateService({
 	Name = "HotbarService",
 	Client = {
-		HotbarUpdated = Knit.CreateSignal(),
+		HotbarUpdated = Knit.CreateSignal(), -- fires to caller with latest snapshot
 	},
-
-	-- internal
-	_setCooldown = {}, -- [player] = lastTime
 })
 
----- Components
---- component utilities
-local componentsInitializer = require(ReplicatedStorage.SharedSource.Utilities.ScriptsLoader.ComponentsInitializer)
---- component folders
-local componentsFolder = script:WaitForChild("Components", 5)
-HotbarService.Components = {}
-for _, v in pairs(componentsFolder:WaitForChild("Others", 10):GetChildren()) do
-	HotbarService.Components[v.Name] = require(v)
-end
-local self_GetComponent = require(componentsFolder["Get()"])
-HotbarService.GetComponent = self_GetComponent
-HotbarService.SetComponent = require(componentsFolder["Set()"])
-
----- Knit Services
 local ProfileService
-local SaveService
+local _throttle = {} -- [player] = last os.clock()
 
----- Configs
-local ConfigsFolder = ReplicatedStorage:WaitForChild("Configs", 10)
-local ConfigPack = ConfigsFolder and require(ConfigsFolder:WaitForChild("ConfigPack", 10))
+local function now() return os.clock() end
+local function snapshot(data) return { Hotbar = (data and data.Hotbar) or {} } end
 
--- Client API
-function HotbarService.Client:SetSlot(player: Player, slotIndex: number, id: string | nil)
-	-- Throttle per-player requests
-	local now = os.clock()
-	local last = self.Server._setCooldown[player]
-	if last and (now - last) < 0.2 then
-		return { ok = false, reason = "throttled" }
+function HotbarService:_setSlot(player: Player, slotIndex: number, idOrNil: string?)
+	if type(slotIndex) ~= "number" or slotIndex < 1 or slotIndex > 4 then
+		return { ok=false, reason="bad-slot" }
 	end
-	self.Server._setCooldown[player] = now
+	local _, data = ProfileService:GetProfile(player)
+	if not data then return { ok=false, reason="no-profile" } end
 
-	local result = self.Server.SetComponent:SetSlot(player, slotIndex, id)
-	if result and result.ok then
-		self.Server.Client.HotbarUpdated:Fire(player, result.snapshot)
-	end
-	return result
+	data.Hotbar = data.Hotbar or {}
+	data.Hotbar[slotIndex] = idOrNil -- nil = clear
+	ProfileService:ChangeData(player, {"Hotbar", slotIndex}, idOrNil)
+
+	return { ok=true, snapshot = snapshot(data) }
 end
 
--- Server helpers
+function HotbarService.Client:SetSlot(player: Player, slotIndex: number, idOrNil: string?)
+	local t = now()
+	local last = _throttle[player]
+	if last and (t - last) < 0.2 then
+		return { ok=false, reason="throttled" }
+	end
+	_throttle[player] = t
+
+	local res = self.Server:_setSlot(player, slotIndex, idOrNil)
+	if res and res.ok then
+		self.Server.Client.HotbarUpdated:Fire(player, res.snapshot)
+	end
+	return res
+end
+
 function HotbarService:GetSnapshot(player: Player)
-	return self_GetComponent:GetSnapshot(player)
-end
-
-function HotbarService:KnitStart()
-	Players.PlayerRemoving:Connect(function(player)
-		self._setCooldown[player] = nil
-	end)
+	local _, data = ProfileService:GetProfile(player)
+	return snapshot(data)
 end
 
 function HotbarService:KnitInit()
-	---- Knit Services
 	ProfileService = Knit.GetService("ProfileService")
-	SaveService = Knit.GetService("SaveService")
+end
 
-	---- Components Initializer
-	componentsInitializer(script)
+function HotbarService:KnitStart()
+	Players.PlayerRemoving:Connect(function(p) _throttle[p] = nil end)
 end
 
 return HotbarService
