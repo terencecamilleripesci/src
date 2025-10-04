@@ -1,197 +1,136 @@
--- ServerScriptService/ServerSource/Server/StatsService/init.lua
-
+-- ServerScriptService/ServerSource/Server/StatService/init.lua
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
 
 local Knit = require(ReplicatedStorage.Packages.Knit)
 
-local StatsService = Knit.CreateService({
-	Name = "StatsService",
-	Client = {
-		StatsChanged = Knit.CreateSignal(), -- snapshot to that player
-		LevelChanged = Knit.CreateSignal(), -- level/xp to that player
-	},
-	_allocCooldown = {}, -- [player] = lastTime
+local StatService = Knit.CreateService({
+    Name = "StatService", -- << singular, authoritative
+    Client = {
+        StatsChanged = Knit.CreateSignal(),
+        LevelChanged = Knit.CreateSignal(),
+    },
+    _allocCooldown = {}, -- [player] = lastTime
 })
 
--- ──────────────────────────────────────────────────────────────────────────────
--- Components / Config
+-- Components bootstrap
 local componentsInitializer = require(ReplicatedStorage.SharedSource.Utilities.ScriptsLoader.ComponentsInitializer)
 local componentsFolder = script:WaitForChild("Components", 5)
-
-StatsService.Components = {}
-for _,v in ipairs(componentsFolder:WaitForChild("Others", 10):GetChildren()) do
-	StatsService.Components[v.Name] = require(v)
+StatService.Components = {}
+for _, v in pairs(componentsFolder:WaitForChild("Others", 10):GetChildren()) do
+    StatService.Components[v.Name] = require(v)
 end
+local self_GetComponent = require(componentsFolder["Get()"])
+StatService.GetComponent = self_GetComponent
+StatService.SetComponent = require(componentsFolder["Set()"])
 
-local GetComponent = require(componentsFolder["Get()"])
-StatsService.GetComponent = GetComponent
-StatsService.SetComponent = require(componentsFolder["Set()"])
-
-local ConfigsFolder = ReplicatedStorage:WaitForChild("Configs", 10)
-local ConfigPack = require(ConfigsFolder:WaitForChild("ConfigPack", 10))
-
--- Deferred requires (loaded in KnitStart)
-local StatCalculator
+-- Knit services we depend on
+local ProfileService
 local XPLevel
+local StatCalculator
 
--- Knit services
-local ProfileService -- set in KnitInit()
+-- Small helpers
+local function now() return os.clock() end
 
--- ──────────────────────────────────────────────────────────────────────────────
--- Utilities
-
-local function num(v, default)
-	return (type(v) == "number") and v or default
+function StatService:GetSnapshot(player)
+    return self_GetComponent:GetSnapshot(player)
 end
 
-local function sanitizeProfile(player)
-	-- Ensure the profile has safe numbers so we never compare number < nil
-	local _, data = ProfileService:GetProfile(player)
-	if not data then return false end
-
-	local changed = false
-
-	-- Level / XP defaults
-	if type(data.Level) ~= "number" then data.Level = 1; ProfileService:ChangeData(player, {"Level"}, 1); changed = true end
-	if type(data.XP)    ~= "number" then data.XP    = 0; ProfileService:ChangeData(player, {"XP"},    0); changed = true end
-	if type(data.UnspentPoints) ~= "number" then
-		data.UnspentPoints = 0; ProfileService:ChangeData(player, {"UnspentPoints"}, 0); changed = true
-	end
-
-	-- Stats table + base keys
-	data.Stats = data.Stats or {}
-	for k,base in pairs(ConfigPack.Stats.Base) do
-		if type(data.Stats[k]) ~= "number" then
-			data.Stats[k] = base
-			ProfileService:ChangeData(player, {"Stats", k}, base)
-			changed = true
-		end
-	end
-
-	return changed
+function StatService:GetDerived(player)
+    local _, data = ProfileService:GetProfile(player)
+    if not data then return nil end
+    if not StatCalculator then
+        StatCalculator = require(componentsFolder.Others.StatCalculator)
+    end
+    local ConfigPack = require(ReplicatedStorage.Configs.ConfigPack)
+    return StatCalculator.BuildDerived(data.Stats or {}, ConfigPack)
 end
 
-local function safeLevelXP(player)
-	local _, data = ProfileService:GetProfile(player)
-	if not data then return 1, 0 end
-	return num(data.Level, 1), num(data.XP, 0)
+-- Add XP and handle level ups safely
+function StatService:AddXP(player: Player, amount: number)
+    amount = tonumber(amount) or 0
+    if amount <= 0 then
+        return { ok = false, reason = "bad-amount" }
+    end
+
+    local _, data = ProfileService:GetProfile(player)
+    if not data then return { ok=false, reason="no-profile" } end
+
+    local ConfigPack = require(ReplicatedStorage.Configs.ConfigPack)
+    if not XPLevel then
+        XPLevel = require(componentsFolder.Others.XPLevel)
+    end
+
+    local newLevel, newXP, points = XPLevel.Compute(
+        tonumber(data.Level) or 1,
+        tonumber(data.XP) or 0,
+        amount,
+        ConfigPack
+    )
+
+    points = tonumber(points) or 0
+
+    if newLevel ~= (tonumber(data.Level) or 1) then
+        ProfileService:ChangeData(player, {"Level"}, newLevel)
+        ProfileService:ChangeData(player, {"UnspentPoints"}, (tonumber(data.UnspentPoints) or 0) + points)
+    else
+        ProfileService:ChangeData(player, {"XP"}, newXP)
+    end
+
+    return { ok = true, level = newLevel, xp = newXP, pointsAwarded = points }
 end
 
--- ──────────────────────────────────────────────────────────────────────────────
--- Public helpers
+-- Client API: allocate stat points with throttling and nil-safe math
+function StatService.Client:AllocatePoints(player: Player, statName: string, count: number)
+    local srv = self.Server
 
-function StatsService:GetSnapshot(player)
-	return GetComponent:GetSnapshot(player)
+    local last = srv._allocCooldown[player]
+    local t = now()
+    if last and (t - last) < 0.2 then
+        return { ok=false, reason="throttled" }
+    end
+    srv._allocCooldown[player] = t
+
+    count = math.floor(tonumber(count) or 0)
+    if count == 0 then return { ok=false, reason="zero" } end
+
+    -- Delegate to Set() which does full validation and writes to ProfileService
+    local result = srv.SetComponent:AllocatePoints(player, tostring(statName or ""), count)
+
+    if result and result.ok then
+        srv.Client.StatsChanged:Fire(player, result.snapshot)
+    end
+    return result
 end
 
-function StatsService:GetDerived(player)
-	local _, data = ProfileService:GetProfile(player)
-	if not data then return nil end
-	StatCalculator = StatCalculator or require(componentsFolder.Others.StatCalculator)
-	return StatCalculator.BuildDerived(data.Stats or {}, ConfigPack)
+function StatService:_rebroadcastLevelXP(player: Player)
+    local _, data = ProfileService:GetProfile(player)
+    if not data then return end
+    self.Client.LevelChanged:Fire(player, tonumber(data.Level) or 1, tonumber(data.XP) or 0)
 end
 
-function StatsService:AddXP(player: Player, amount: number)
-	if type(amount) ~= "number" or amount <= 0 then
-		return { ok=false, reason="bad-amount" }
-	end
+function StatService:KnitStart()
+    -- Late requires
+    XPLevel = require(componentsFolder.Others.XPLevel)
+    StatCalculator = require(componentsFolder.Others.StatCalculator)
 
-	-- ALWAYS sanitize before math
-	sanitizeProfile(player)
+    -- When ProfileService changes Level/XP, rebroadcast to client
+    ProfileService.UpdateSpecificData:Connect(function(player, path)
+        if not player or not path or #path == 0 then return end
+        local root = path[1]
+        if root == "Level" or root == "XP" then
+            self:_rebroadcastLevelXP(player)
+        end
+    end)
 
-	local level, xp = safeLevelXP(player)
-
-	XPLevel = XPLevel or require(componentsFolder.Others.XPLevel)
-	local newLevel, newXP, points = XPLevel.Compute(level, xp, amount, ConfigPack)
-
-	if newLevel ~= level then
-		ProfileService:ChangeData(player, {"Level"}, newLevel)
-		ProfileService:ChangeData(player, {"UnspentPoints"}, (ProfileService:GetProfile(player)).Data.UnspentPoints + (points or 0))
-	else
-		ProfileService:ChangeData(player, {"XP"}, newXP)
-	end
-
-	self.Client.LevelChanged:Fire(player, newLevel, newXP)
-	return { ok=true, level=newLevel, xp=newXP, pointsAwarded=points or 0 }
+    Players.PlayerRemoving:Connect(function(player)
+        self._allocCooldown[player] = nil
+    end)
 end
 
--- ──────────────────────────────────────────────────────────────────────────────
--- Client API
-
-function StatsService.Client:AllocatePoints(player: Player, statName: string, count: number)
-	local now = os.clock()
-	local last = self.Server._allocCooldown[player]
-	if last and (now - last) < 0.2 then
-		return { ok=false, reason="throttled" }
-	end
-	self.Server._allocCooldown[player] = now
-
-	-- sanitize before doing any math
-	sanitizeProfile(player)
-
-	local result = self.Server.SetComponent:AllocatePoints(player, statName, count)
-	if result and result.ok then
-		self.Server.Client.StatsChanged:Fire(player, result.snapshot)
-	end
-	return result
+function StatService:KnitInit()
+    ProfileService = Knit.GetService("ProfileService")
+    componentsInitializer(script)
 end
 
--- ──────────────────────────────────────────────────────────────────────────────
--- Knit lifecycle
-
-function StatsService:KnitStart()
-	-- Lazy requires
-	StatCalculator = require(componentsFolder.Others.StatCalculator)
-	XPLevel = require(componentsFolder.Others.XPLevel)
-
-	-- Make sure every current player is sanitized (Studio re-run safety)
-	for _,p in ipairs(Players:GetPlayers()) do
-		task.defer(function()
-			-- try a few times until profile exists
-			for _=1,50 do
-				if sanitizeProfile(p) ~= nil then break end
-				task.wait(0.1)
-			end
-			local L, X = safeLevelXP(p)
-			self.Client.LevelChanged:Fire(p, L, X)
-		end)
-	end
-
-	-- New players
-	Players.PlayerAdded:Connect(function(p)
-		task.defer(function()
-			for _=1,50 do
-				if sanitizeProfile(p) ~= nil then break end
-				task.wait(0.1)
-			end
-			local L, X = safeLevelXP(p)
-			self.Client.LevelChanged:Fire(p, L, X)
-		end)
-	end)
-
-	-- Clean cooldowns
-	Players.PlayerRemoving:Connect(function(p)
-		self._allocCooldown[p] = nil
-	end)
-
-	-- If your ProfileService broadcasts changes, mirror level/xp to client
-	if ProfileService and ProfileService.UpdateSpecificData then
-		ProfileService.UpdateSpecificData:Connect(function(player, path, _)
-			if not player or not path or #path == 0 then return end
-			if path[1] == "Level" or path[1] == "XP" then
-				local L, X = safeLevelXP(player)
-				self.Client.LevelChanged:Fire(player, L, X)
-			end
-		end)
-	end
-
-	componentsInitializer(script) -- keep your component system warm
-end
-
-function StatsService:KnitInit()
-	ProfileService = Knit.GetService("ProfileService")
-end
-
-return StatsService
+return StatService
